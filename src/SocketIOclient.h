@@ -12,6 +12,8 @@
 #include "WebSocketsClient.h"
 
 #define EIO_HEARTBEAT_INTERVAL 20000
+#define SIO_ACK_TIMEOUT 5000
+#define SIO_MAX_PENDING_ACKS 64
 
 #define EIO_MAX_HEADER_SIZE (WEBSOCKETS_MAX_HEADER_SIZE + 1)
 #define SIO_MAX_HEADER_SIZE (EIO_MAX_HEADER_SIZE + 1)
@@ -35,6 +37,13 @@ typedef enum {
     sIOtype_BINARY_EVENT = '5',
     sIOtype_BINARY_ACK   = '6',
 } socketIOmessageType_t;
+
+
+struct Pending {
+    uint32_t   ts;
+    uint16_t   id;
+    String frame;
+};
 
 class SocketIOclient : protected WebSocketsClient {
   public:
@@ -73,7 +82,13 @@ class SocketIOclient : protected WebSocketsClient {
     bool sendEVENT(const char * payload, size_t length = 0);
     bool sendEVENT(String & payload);
 
-    bool send(socketIOmessageType_t type, uint8_t * payload, size_t length = 0, bool headerToPayload = false);
+    bool sendACK(uint8_t * payload, size_t length = 0, bool headerToPayload = false);
+    bool sendACK(const uint8_t * payload, size_t length = 0);
+    bool sendACK(char * payload, size_t length = 0, bool headerToPayload = false);
+    bool sendACK(const char * payload, size_t length = 0);
+    bool sendACK(String & payload);
+
+    bool send(socketIOmessageType_t type, uint8_t * payload, size_t length = 0, bool headerToPayload = false, bool ack = false);
     bool send(socketIOmessageType_t type, const uint8_t * payload, size_t length = 0);
     bool send(socketIOmessageType_t type, char * payload, size_t length = 0, bool headerToPayload = false);
     bool send(socketIOmessageType_t type, const char * payload, size_t length = 0);
@@ -90,6 +105,8 @@ class SocketIOclient : protected WebSocketsClient {
     bool _disableHeartbeat  = false;
     uint64_t _lastHeartbeat = 0;
     SocketIOclientEvent _cbEvent;
+    uint16_t _nextAckId = 0;
+    Pending _pending[SIO_MAX_PENDING_ACKS];
     virtual void runIOCbEvent(socketIOmessageType_t type, uint8_t * payload, size_t length) {
         if(_cbEvent) {
             _cbEvent(type, payload, length);
@@ -103,6 +120,7 @@ class SocketIOclient : protected WebSocketsClient {
         handleCbEvent(type, payload, length);
     }
     void handleCbEvent(WStype_t type, uint8_t * payload, size_t length);
+    uint16_t parseAckId(const uint8_t* buf, size_t len);
 };
 
 #endif /* SOCKETIOCLIENT_H_ */

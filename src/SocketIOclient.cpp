@@ -106,27 +106,50 @@ void SocketIOclient::disconnect(void) {
  * @param headerToPayload bool (see sendFrame for more details)
  * @return true if ok
  */
-bool SocketIOclient::send(socketIOmessageType_t type, uint8_t * payload, size_t length, bool headerToPayload) {
-    bool ret = false;
-    if(length == 0) {
-        length = strlen((const char *)payload);
+bool SocketIOclient::send(socketIOmessageType_t type,
+                          uint8_t* payload,
+                          size_t   length,
+                          bool     headerToPayload,
+                          bool     ack)
+{
+    if (length == 0 && payload) { length = strlen((char*)payload); }
+
+    if (!clientIsConnected(&_client) || _client.status != WSC_CONNECTED) {
+        return false;
     }
-    if(clientIsConnected(&_client) && _client.status == WSC_CONNECTED) {
-        if(!headerToPayload) {
-            // webSocket Header
-            ret = WebSocketsClient::sendFrameHeader(&_client, WSop_text, length + 2, true);
-            // Engine.IO / Socket.IO Header
-            if(ret) {
-                uint8_t buf[3] = { eIOtype_MESSAGE, type, 0x00 };
-                ret            = WebSocketsClient::write(&_client, buf, 2);
-            }
-            if(ret && payload && length > 0) {
-                ret = WebSocketsClient::write(&_client, payload, length);
-            }
-            return ret;
-        } else {
-            // TODO implement
+    char   idBuf[8];
+    size_t idLen = 0;
+    String frame;
+    frame.reserve(idLen + length);
+    frame.concat(idBuf);
+    frame += String((const char*)payload, length);
+    if (!headerToPayload && ack && type == sIOtype_EVENT) {
+        idLen = sprintf(idBuf, "%u", _nextAckId);
+        if (_pending[_nextAckId % SIO_MAX_PENDING_ACKS].id != 0) {
+            DEBUG_WEBSOCKETS("[wsIOc] Warning: pending ACK ID %d already exists, overwriting\n", _nextAckId);
+            DEBUG_WEBSOCKETS("[wsIOc] [Hint] Increase SIO_MAX_PENDING_ACKS if you need more pending ACKs\n");
         }
+        _pending[_nextAckId % SIO_MAX_PENDING_ACKS].ts = millis();
+        _pending[_nextAckId % SIO_MAX_PENDING_ACKS].id = _nextAckId;
+        _pending[_nextAckId % SIO_MAX_PENDING_ACKS].frame = frame;
+        _nextAckId++;
+    }
+
+    if (!headerToPayload) {
+        if (!WebSocketsClient::sendFrameHeader(&_client,
+                                               WSop_text,
+                                               length + idLen + 2,
+                                               true)) return false;
+
+        uint8_t hdr[2] = { eIOtype_MESSAGE, type };
+        if (!WebSocketsClient::write(&_client, hdr, 2)) return false;
+        if (idLen && !WebSocketsClient::write(&_client,
+                                              (uint8_t*)idBuf,
+                                              idLen)) return false;
+        if (payload && length) {
+            return WebSocketsClient::write(&_client, payload, length);
+        }
+        return true;
     }
     return false;
 }
@@ -175,6 +198,35 @@ bool SocketIOclient::sendEVENT(String & payload) {
     return sendEVENT((uint8_t *)payload.c_str(), payload.length());
 }
 
+/**
+ * send text data to client with ACK. Error if couldn´t be delivered
+ * @param num uint8_t client id
+ * @param payload uint8_t *
+ * @param length size_t
+ * @param headerToPayload bool  (see sendFrame for more details)
+ * @return true if ok
+ */
+
+bool SocketIOclient::sendACK(uint8_t * payload, size_t length, bool headerToPayload) {
+    return send(sIOtype_EVENT, payload, length, headerToPayload, true);
+}
+
+bool SocketIOclient::sendACK(const uint8_t * payload, size_t length) {
+    return sendACK((uint8_t *)payload, length);
+}
+
+bool SocketIOclient::sendACK(char * payload, size_t length, bool headerToPayload) {
+    return sendACK((uint8_t *)payload, length, headerToPayload);
+}
+
+bool SocketIOclient::sendACK(const char * payload, size_t length) {
+    return sendACK((uint8_t *)payload, length, false);
+}
+
+bool SocketIOclient::sendACK(String & payload) {
+    return sendACK((uint8_t *)payload.c_str(), payload.length(), false);
+}
+
 void SocketIOclient::loop(void) {
     WebSocketsClient::loop();
     unsigned long t = millis();
@@ -182,6 +234,25 @@ void SocketIOclient::loop(void) {
         _lastHeartbeat = t;
         DEBUG_WEBSOCKETS("[wsIOc] send ping\n");
         WebSocketsClient::sendTXT(eIOtype_PING);
+    }
+    
+    for( int i = 0; i < SIO_MAX_PENDING_ACKS; i++) {
+        if (_pending[i].id != 0) continue;
+        if ((t - _pending[i].ts) > SIO_ACK_TIMEOUT) {
+            DEBUG_WEBSOCKETS("[wsIOc] pending ACK ID %d timed out\n retrying...\n", _pending[i].id);
+            _pending[i].id = 0;
+            sendFrameHeader(&_client, WSop_text, 2 + _pending[i].frame.length(), true);
+            uint8_t hdr[2] = { eIOtype_MESSAGE, sIOtype_EVENT };
+            WebSocketsClient::write(&_client, hdr, 2);
+            WebSocketsClient::write(&_client,
+                                    (uint8_t*)_pending[i].frame.c_str(),
+                                    _pending[i].frame.length());
+
+            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].id = _nextAckId;
+            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].ts = t;
+            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].frame = _pending[i].frame;
+            _nextAckId++;
+        }
     }
 }
 
@@ -221,15 +292,33 @@ void SocketIOclient::handleCbEvent(WStype_t type, uint8_t * payload, size_t leng
                     socketIOmessageType_t ioType = (socketIOmessageType_t)payload[1];
                     uint8_t * data               = &payload[2];
                     size_t lData                 = length - 2;
+                    int id = parseAckId(data, lData);
                     switch(ioType) {
                         case sIOtype_EVENT:
                             DEBUG_WEBSOCKETS("[wsIOc] get event (%d): %s\n", lData, data);
+                            if( id != 0) {
+                                DEBUG_WEBSOCKETS("[wsIOc] Ack ID %d found in event\n. Sending Ack", id);
+                                send(sIOtype_ACK, (uint8_t *)data, lData, false, true);
+                            }
                             break;
                         case sIOtype_CONNECT:
                             DEBUG_WEBSOCKETS("[wsIOc] connected (%d): %s\n", lData, data);
                             return;
                         case sIOtype_DISCONNECT:
+                            DEBUG_WEBSOCKETS("[wsIOc] disconnected (%d): %s\n", lData, data);
+                            break;
                         case sIOtype_ACK:
+                            DEBUG_WEBSOCKETS("[wsIOc] Acknoledge Message received (%d): %s\n", lData, data);
+                            if( id != 0) {
+                                if( _pending[id % SIO_MAX_PENDING_ACKS].id == id &&
+                                    (millis() - _pending[id % SIO_MAX_PENDING_ACKS].ts) < SIO_ACK_TIMEOUT) {
+                                    DEBUG_WEBSOCKETS("[wsIOc] Ack for ID %d received\n", id);
+                                    _pending[id % SIO_MAX_PENDING_ACKS].id = 0;
+                                } else {
+                                    DEBUG_WEBSOCKETS("[wsIOc] Ack for ID %d not found or timed out\n", id);
+                                }
+                            }
+                            break;
                         case sIOtype_ERROR:
                         case sIOtype_BINARY_EVENT:
                         case sIOtype_BINARY_ACK:
@@ -261,4 +350,20 @@ void SocketIOclient::handleCbEvent(WStype_t type, uint8_t * payload, size_t leng
         case WStype_PONG:
             break;
     }
+}
+
+uint16_t SocketIOclient::parseAckId(const uint8_t* buf, size_t len)
+{
+    const char* bracket = (const char*)memchr(buf, '[', len);
+    if (!bracket) return 0;
+
+    const char* idEnd   = bracket;
+    const char* idStart = idEnd;
+    while (idStart > (const char*)buf && isdigit(*(idStart - 1))) {
+        --idStart;
+    }
+
+    if (idStart == idEnd) return 0;
+
+    return (uint16_t)strtol(idStart, nullptr, 10);
 }
