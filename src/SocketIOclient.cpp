@@ -119,19 +119,27 @@ bool SocketIOclient::send(socketIOmessageType_t type,
     }
     char   idBuf[8];
     size_t idLen = 0;
-    String frame;
-    frame.reserve(idLen + length);
-    frame.concat(idBuf);
-    frame += String((const char*)payload, length);
+    
+    // FIXED: ACK-ID erst NACH frame-Aufbau generieren
     if (!headerToPayload && ack && type == sIOtype_EVENT) {
         idLen = sprintf(idBuf, "%u", _nextAckId);
         if (_pending[_nextAckId % SIO_MAX_PENDING_ACKS].id != 0) {
             DEBUG_WEBSOCKETS("[wsIOc] Warning: pending ACK ID %d already exists, overwriting\n", _nextAckId);
             DEBUG_WEBSOCKETS("[wsIOc] [Hint] Increase SIO_MAX_PENDING_ACKS if you need more pending ACKs\n");
         }
+    }
+    
+    String frame;
+    frame.reserve(idLen + length);
+    if (idLen > 0) frame.concat(idBuf);  // FIXED: Nur ID hinzufügen wenn ACK
+    frame += String((const char*)payload, length);
+    
+    // FIXED: Pending ACK erst NACH frame-Aufbau speichern
+    if (!headerToPayload && ack && type == sIOtype_EVENT) {
         _pending[_nextAckId % SIO_MAX_PENDING_ACKS].ts = millis();
         _pending[_nextAckId % SIO_MAX_PENDING_ACKS].id = _nextAckId;
         _pending[_nextAckId % SIO_MAX_PENDING_ACKS].frame = frame;
+        DEBUG_WEBSOCKETS("[wsIOc] Storing ACK frame ID %d: %s\n", _nextAckId, frame.c_str());
         _nextAckId++;
     }
 
@@ -236,11 +244,19 @@ void SocketIOclient::loop(void) {
         WebSocketsClient::sendTXT(eIOtype_PING);
     }
     
+    // Nur ACK-Retry wenn verbunden
+    if (!clientIsConnected(&_client) || _client.status != WSC_CONNECTED) {
+        return;
+    }
+    
     for( int i = 0; i < SIO_MAX_PENDING_ACKS; i++) {
-        if (_pending[i].id != 0) continue;
+        if (_pending[i].id == 0) continue;  // FIXED: war != 0, sollte == 0 sein
         if ((t - _pending[i].ts) > SIO_ACK_TIMEOUT) {
             DEBUG_WEBSOCKETS("[wsIOc] pending ACK ID %d timed out\n retrying...\n", _pending[i].id);
-            _pending[i].id = 0;
+            
+            // Debug: Zeige Frame-Inhalt
+            DEBUG_WEBSOCKETS("[wsIOc] Retrying frame: %s\n", _pending[i].frame.c_str());
+            
             sendFrameHeader(&_client, WSop_text, 2 + _pending[i].frame.length(), true);
             uint8_t hdr[2] = { eIOtype_MESSAGE, sIOtype_EVENT };
             WebSocketsClient::write(&_client, hdr, 2);
@@ -248,10 +264,7 @@ void SocketIOclient::loop(void) {
                                     (uint8_t*)_pending[i].frame.c_str(),
                                     _pending[i].frame.length());
 
-            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].id = _nextAckId;
-            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].ts = t;
-            _pending[_nextAckId % SIO_MAX_PENDING_ACKS].frame = _pending[i].frame;
-            _nextAckId++;
+            _pending[i].ts = t;  // FIXED: Update timestamp für dieses Retry
         }
     }
 }
